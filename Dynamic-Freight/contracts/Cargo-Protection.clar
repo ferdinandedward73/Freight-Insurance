@@ -13,6 +13,7 @@
 (define-constant ERR-INVALID-DURATION (err u108))
 (define-constant ERR-CARGO-NOT-FOUND (err u109))
 (define-constant ERR-SENSOR-NOT-AUTHORIZED (err u110))
+(define-constant ERR-INVALID-INPUT (err u111))
 
 ;; Contract owner principal
 (define-constant CONTRACT-OWNER tx-sender)
@@ -38,6 +39,10 @@
 (define-constant POLICY-STATUS-ACTIVE u1)
 (define-constant POLICY-STATUS-EXPIRED u2)
 (define-constant POLICY-STATUS-CLAIMED u3)
+
+;; Maximum values for input validation
+(define-constant MAX-CARGO-ID u1000000)
+(define-constant MAX-POLICY-ID u1000000)
 
 ;; Data structure for insurance policies
 (define-map insurance-policies 
@@ -77,10 +82,24 @@
 ;; Cargo counter for unique cargo IDs
 (define-data-var cargo-counter uint u0)
 
+;; Input validation functions
+(define-private (is-valid-principal (p principal))
+    (not (is-eq p 'SP000000000000000000002Q6VF78))  ;; Check for null principal
+)
+
+(define-private (is-valid-cargo-id (cargo-id uint))
+    (and (> cargo-id u0) (<= cargo-id MAX-CARGO-ID))
+)
+
+(define-private (is-valid-policy-id (policy-id uint))
+    (and (> policy-id u0) (<= policy-id MAX-POLICY-ID))
+)
+
 ;; Function to authorize sensor principals (only contract owner)
 (define-public (authorize-sensor (sensor principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-valid-principal sensor) ERR-INVALID-INPUT)
         (ok (map-set authorized-sensors { sensor: sensor } { authorized: true }))
     )
 )
@@ -89,6 +108,7 @@
 (define-public (revoke-sensor-authorization (sensor principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-valid-principal sensor) ERR-INVALID-INPUT)
         (ok (map-set authorized-sensors { sensor: sensor } { authorized: false }))
     )
 )
@@ -149,172 +169,229 @@
     (let (
         (new-policy-id (+ (var-get policy-counter) u1))
         (base-premium (/ (* cargo-value BASE-PREMIUM-RATE) u1000))
-        (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: cargo-id }) ERR-CARGO-NOT-FOUND))
-        (risk-multiplier (calculate-risk-multiplier 
-            (get temperature cargo-data)
-            (get humidity cargo-data)
-            (get shock-level cargo-data)
-        ))
-        (initial-premium (/ (* base-premium risk-multiplier) u100))
+        (validated-cargo-id cargo-id)  ;; Store validated input
     )
+        ;; Input validation
         (asserts! (> cargo-value u0) ERR-INVALID-PREMIUM)
         (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
-        (asserts! (is-eq tx-sender (get owner cargo-data)) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (is-none (map-get? insurance-policies { policy-id: new-policy-id })) ERR-POLICY-ALREADY-EXISTS)
+        (asserts! (is-valid-cargo-id validated-cargo-id) ERR-INVALID-INPUT)
         
-        (var-set policy-counter new-policy-id)
-        (map-set insurance-policies 
-            { policy-id: new-policy-id }
-            {
-                policyholder: tx-sender,
-                cargo-value: cargo-value,
-                base-premium: base-premium,
-                current-premium: initial-premium,
-                start-block: block-height,
-                end-block: (+ block-height duration-blocks),
-                status: POLICY-STATUS-ACTIVE,
-                total-paid: u0,
-                claim-amount: u0,
-                cargo-id: cargo-id
-            }
+        (let (
+            (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: validated-cargo-id }) ERR-CARGO-NOT-FOUND))
+            (risk-multiplier (calculate-risk-multiplier 
+                (get temperature cargo-data)
+                (get humidity cargo-data)
+                (get shock-level cargo-data)
+            ))
+            (initial-premium (/ (* base-premium risk-multiplier) u100))
         )
-        (ok new-policy-id)
+            (asserts! (is-eq tx-sender (get owner cargo-data)) ERR-UNAUTHORIZED-ACCESS)
+            (asserts! (is-none (map-get? insurance-policies { policy-id: new-policy-id })) ERR-POLICY-ALREADY-EXISTS)
+            
+            (var-set policy-counter new-policy-id)
+            (map-set insurance-policies 
+                { policy-id: new-policy-id }
+                {
+                    policyholder: tx-sender,
+                    cargo-value: cargo-value,
+                    base-premium: base-premium,
+                    current-premium: initial-premium,
+                    start-block: block-height,
+                    end-block: (+ block-height duration-blocks),
+                    status: POLICY-STATUS-ACTIVE,
+                    total-paid: u0,
+                    claim-amount: u0,
+                    cargo-id: validated-cargo-id
+                }
+            )
+            (ok new-policy-id)
+        )
     )
 )
 
 ;; Function to update cargo conditions (only authorized sensors)
 (define-public (update-conditions (cargo-id uint) (temperature uint) (humidity uint) (shock-level uint))
     (let (
+        (validated-cargo-id cargo-id)  ;; Store validated input
         (sensor-auth (default-to { authorized: false } (map-get? authorized-sensors { sensor: tx-sender })))
-        (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: cargo-id }) ERR-CARGO-NOT-FOUND))
     )
+        ;; Input validation
+        (asserts! (is-valid-cargo-id validated-cargo-id) ERR-INVALID-INPUT)
         (asserts! (get authorized sensor-auth) ERR-SENSOR-NOT-AUTHORIZED)
         (asserts! (<= temperature u100) ERR-INVALID-CONDITION-VALUE)
         (asserts! (<= humidity u100) ERR-INVALID-CONDITION-VALUE)
         (asserts! (<= shock-level u200) ERR-INVALID-CONDITION-VALUE)
         
-        (map-set cargo-conditions 
-            { cargo-id: cargo-id }
-            {
-                temperature: temperature,
-                humidity: humidity,
-                shock-level: shock-level,
-                last-updated: block-height,
-                owner: (get owner cargo-data)
-            }
+        (let (
+            (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: validated-cargo-id }) ERR-CARGO-NOT-FOUND))
         )
-        (ok true)
+            (map-set cargo-conditions 
+                { cargo-id: validated-cargo-id }
+                {
+                    temperature: temperature,
+                    humidity: humidity,
+                    shock-level: shock-level,
+                    last-updated: block-height,
+                    owner: (get owner cargo-data)
+                }
+            )
+            (ok true)
+        )
     )
 )
 
 ;; Function to recalculate and update premium based on current conditions
 (define-public (update-premium (policy-id uint))
     (let (
-        (policy-data (unwrap! (map-get? insurance-policies { policy-id: policy-id }) ERR-POLICY-NOT-FOUND))
-        (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: (get cargo-id policy-data) }) ERR-CARGO-NOT-FOUND))
-        (risk-multiplier (calculate-risk-multiplier 
-            (get temperature cargo-data)
-            (get humidity cargo-data)
-            (get shock-level cargo-data)
-        ))
-        (new-premium (/ (* (get base-premium policy-data) risk-multiplier) u100))
+        (validated-policy-id policy-id)  ;; Store validated input
     )
-        (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
-        (asserts! (< block-height (get end-block policy-data)) ERR-POLICY-EXPIRED)
+        ;; Input validation
+        (asserts! (is-valid-policy-id validated-policy-id) ERR-INVALID-INPUT)
         
-        (map-set insurance-policies 
-            { policy-id: policy-id }
-            (merge policy-data { current-premium: new-premium })
+        (let (
+            (policy-data (unwrap! (map-get? insurance-policies { policy-id: validated-policy-id }) ERR-POLICY-NOT-FOUND))
+            (cargo-data (unwrap! (map-get? cargo-conditions { cargo-id: (get cargo-id policy-data) }) ERR-CARGO-NOT-FOUND))
+            (risk-multiplier (calculate-risk-multiplier 
+                (get temperature cargo-data)
+                (get humidity cargo-data)
+                (get shock-level cargo-data)
+            ))
+            (new-premium (/ (* (get base-premium policy-data) risk-multiplier) u100))
         )
-        (ok new-premium)
+            (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
+            (asserts! (< block-height (get end-block policy-data)) ERR-POLICY-EXPIRED)
+            
+            (map-set insurance-policies 
+                { policy-id: validated-policy-id }
+                (merge policy-data { current-premium: new-premium })
+            )
+            (ok new-premium)
+        )
     )
 )
 
 ;; Function to pay premium (callable by policyholder)
 (define-public (pay-premium (policy-id uint))
     (let (
-        (policy-data (unwrap! (map-get? insurance-policies { policy-id: policy-id }) ERR-POLICY-NOT-FOUND))
-        (premium-amount (get current-premium policy-data))
+        (validated-policy-id policy-id)  ;; Store validated input
     )
-        (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
-        (asserts! (< block-height (get end-block policy-data)) ERR-POLICY-EXPIRED)
+        ;; Input validation
+        (asserts! (is-valid-policy-id validated-policy-id) ERR-INVALID-INPUT)
         
-        (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
-        
-        (map-set insurance-policies 
-            { policy-id: policy-id }
-            (merge policy-data { total-paid: (+ (get total-paid policy-data) premium-amount) })
+        (let (
+            (policy-data (unwrap! (map-get? insurance-policies { policy-id: validated-policy-id }) ERR-POLICY-NOT-FOUND))
+            (premium-amount (get current-premium policy-data))
         )
-        (ok premium-amount)
+            (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR-UNAUTHORIZED-ACCESS)
+            (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
+            (asserts! (< block-height (get end-block policy-data)) ERR-POLICY-EXPIRED)
+            
+            (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+            
+            (map-set insurance-policies 
+                { policy-id: validated-policy-id }
+                (merge policy-data { total-paid: (+ (get total-paid policy-data) premium-amount) })
+            )
+            (ok premium-amount)
+        )
     )
 )
 
 ;; Function to file insurance claim
 (define-public (file-claim (policy-id uint) (claim-amount uint))
     (let (
-        (policy-data (unwrap! (map-get? insurance-policies { policy-id: policy-id }) ERR-POLICY-NOT-FOUND))
+        (validated-policy-id policy-id)  ;; Store validated input
     )
-        (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
-        (asserts! (is-eq (get claim-amount policy-data) u0) ERR-CLAIM-ALREADY-PROCESSED)
-        (asserts! (<= claim-amount (get cargo-value policy-data)) ERR-INVALID-PREMIUM)
+        ;; Input validation
+        (asserts! (is-valid-policy-id validated-policy-id) ERR-INVALID-INPUT)
+        (asserts! (> claim-amount u0) ERR-INVALID-PREMIUM)
         
-        (map-set insurance-policies 
-            { policy-id: policy-id }
-            (merge policy-data { 
-                claim-amount: claim-amount,
-                status: POLICY-STATUS-CLAIMED
-            })
+        (let (
+            (policy-data (unwrap! (map-get? insurance-policies { policy-id: validated-policy-id }) ERR-POLICY-NOT-FOUND))
         )
-        (ok true)
+            (asserts! (is-eq tx-sender (get policyholder policy-data)) ERR-UNAUTHORIZED-ACCESS)
+            (asserts! (is-eq (get status policy-data) POLICY-STATUS-ACTIVE) ERR-POLICY-EXPIRED)
+            (asserts! (is-eq (get claim-amount policy-data) u0) ERR-CLAIM-ALREADY-PROCESSED)
+            (asserts! (<= claim-amount (get cargo-value policy-data)) ERR-INVALID-PREMIUM)
+            
+            (map-set insurance-policies 
+                { policy-id: validated-policy-id }
+                (merge policy-data { 
+                    claim-amount: claim-amount,
+                    status: POLICY-STATUS-CLAIMED
+                })
+            )
+            (ok true)
+        )
     )
 )
 
 ;; Function to process claim payout (only contract owner for now - could be automated)
 (define-public (process-claim (policy-id uint))
     (let (
-        (policy-data (unwrap! (map-get? insurance-policies { policy-id: policy-id }) ERR-POLICY-NOT-FOUND))
-        (claim-amount (get claim-amount policy-data))
+        (validated-policy-id policy-id)  ;; Store validated input
     )
+        ;; Input validation
+        (asserts! (is-valid-policy-id validated-policy-id) ERR-INVALID-INPUT)
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (is-eq (get status policy-data) POLICY-STATUS-CLAIMED) ERR-POLICY-NOT-FOUND)
-        (asserts! (> claim-amount u0) ERR-INVALID-PREMIUM)
         
-        (try! (as-contract (stx-transfer? claim-amount tx-sender (get policyholder policy-data))))
-        (ok claim-amount)
+        (let (
+            (policy-data (unwrap! (map-get? insurance-policies { policy-id: validated-policy-id }) ERR-POLICY-NOT-FOUND))
+            (claim-amount (get claim-amount policy-data))
+        )
+            (asserts! (is-eq (get status policy-data) POLICY-STATUS-CLAIMED) ERR-POLICY-NOT-FOUND)
+            (asserts! (> claim-amount u0) ERR-INVALID-PREMIUM)
+            
+            (try! (as-contract (stx-transfer? claim-amount tx-sender (get policyholder policy-data))))
+            (ok claim-amount)
+        )
     )
 )
 
 ;; Read-only function to get policy details
 (define-read-only (get-policy (policy-id uint))
-    (map-get? insurance-policies { policy-id: policy-id })
+    (if (is-valid-policy-id policy-id)
+        (map-get? insurance-policies { policy-id: policy-id })
+        none
+    )
 )
 
 ;; Read-only function to get cargo conditions
 (define-read-only (get-cargo-conditions (cargo-id uint))
-    (map-get? cargo-conditions { cargo-id: cargo-id })
+    (if (is-valid-cargo-id cargo-id)
+        (map-get? cargo-conditions { cargo-id: cargo-id })
+        none
+    )
 )
 
 ;; Read-only function to get current premium for a policy
 (define-read-only (get-current-premium (policy-id uint))
-    (match (map-get? insurance-policies { policy-id: policy-id })
-        policy-data (some (get current-premium policy-data))
+    (if (is-valid-policy-id policy-id)
+        (match (map-get? insurance-policies { policy-id: policy-id })
+            policy-data (some (get current-premium policy-data))
+            none
+        )
         none
     )
 )
 
 ;; Read-only function to check if sensor is authorized
 (define-read-only (is-sensor-authorized (sensor principal))
-    (match (map-get? authorized-sensors { sensor: sensor })
-        sensor-data (get authorized sensor-data)
+    (if (is-valid-principal sensor)
+        (match (map-get? authorized-sensors { sensor: sensor })
+            sensor-data (get authorized sensor-data)
+            false
+        )
         false
     )
 )
 
 ;; Read-only function to get risk assessment for given conditions
 (define-read-only (assess-risk (temperature uint) (humidity uint) (shock-level uint))
-    (calculate-risk-multiplier temperature humidity shock-level)
+    (if (and (<= temperature u100) (<= humidity u100) (<= shock-level u200))
+        (some (calculate-risk-multiplier temperature humidity shock-level))
+        none
+    )
 )
 
 ;; Read-only function to get total policies count
